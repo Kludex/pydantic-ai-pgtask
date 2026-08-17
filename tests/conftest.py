@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -17,6 +18,9 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 JSON_ADAPTER: TypeAdapter[Any] = TypeAdapter(Any)
 
+UNSUPPORTED_STEP_NAME_CHAR = re.compile(r'[^A-Za-z0-9._:-]')
+"""The character set pgtask accepts in a step name."""
+
 
 @dataclass
 class CheckpointStore:
@@ -32,6 +36,12 @@ class CheckpointStore:
     executions: list[tuple[str, int]] = field(default_factory=list)
 
     async def step(self, name: str, occurrence: int, operation: Callable[[], Awaitable[Any]]) -> Any:
+        # pgtask validates step names natively, so mirror that validation here: a name a real
+        # worker would reject must fail the unit tests too, not only the integration ones.
+        if not name:
+            raise ValueError('step name must not be empty')
+        if unsupported := UNSUPPORTED_STEP_NAME_CHAR.search(name):
+            raise ValueError(f'step name contains unsupported character {unsupported.group()!r}')
         key = (name, occurrence)
         if key not in self.checkpoints:
             self.executions.append(key)

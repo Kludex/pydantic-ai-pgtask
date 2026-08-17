@@ -40,6 +40,31 @@ async def test_step_occurrences_count_per_name(task: Task, store: CheckpointStor
     assert store.executions == [('a', 0), ('a', 1), ('b', 0)]
 
 
+async def test_checkpoint_store_rejects_what_pgtask_rejects(store: CheckpointStore) -> None:
+    """The guard that makes every other test fail on a name a real worker would refuse."""
+
+    async def one() -> int:  # pragma: no cover - never reached, the name is rejected first
+        return 1
+
+    with pytest.raises(ValueError, match='must not be empty'):
+        await store.step('', 0, one)
+    with pytest.raises(ValueError, match="unsupported character '<'"):
+        await store.step('a__function_toolset__<agent>', 0, one)
+
+
+async def test_step_name_is_normalized_to_pgtask_charset(task: Task, store: CheckpointStore) -> None:
+    async with running_task(task):
+        ctx = current_context()
+        assert ctx is not None
+
+        async def one() -> int:
+            return 1
+
+        assert await ctx.step('a__function_toolset__<agent>.call_tool:x', one) == 1
+
+    assert store.executions == [('a__function_toolset___agent_.call_tool:x', 0)]
+
+
 async def test_replay_serves_cached_step(store: CheckpointStore) -> None:
     calls = {'n': 0}
 

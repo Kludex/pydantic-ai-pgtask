@@ -8,7 +8,9 @@ from typing import Any
 
 import pytest
 from pgtask import Client, Task, TaskRegistry, Worker
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelMessage, ModelResponse
+from pydantic_ai.messages import TextPart, ToolCallPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from testcontainers.community.postgres import PostgresContainer
 
 from pydantic_ai_pgtask import PGTaskDurability
@@ -76,6 +78,56 @@ async def test_agent_run_inside_worker_is_durable(db_dsn: str) -> None:
     assert result.state == 'succeeded'
     assert result.result == {'output': 'ok'}
     assert counter['calls'] == 1
+
+
+async def test_agent_tool_call_inside_worker_is_durable(db_dsn: str) -> None:
+    """A tool registered with `@agent.tool_plain` through a real worker: the model calls it on
+    the first request, the handler crashes after the run, and attempt 2 replays every
+    checkpoint - so the tool's side effect happens once even though the run is re-entered."""
+    model_calls = {'calls': 0}
+    tool_calls = {'calls': 0}
+
+    def fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        model_calls['calls'] += 1
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart(tool_name='charge_card', args={'amount': 42})])
+        return ModelResponse(parts=[TextPart(content='done')])
+
+    agent: Agent[None, str] = Agent(
+        FunctionModel(fn, model_name='fn'), name='billing', capabilities=[PGTaskDurability()]
+    )
+
+    @agent.tool_plain
+    def charge_card(amount: int) -> str:
+        tool_calls['calls'] += 1
+        return f'charged {amount}'
+
+    tasks = TaskRegistry(queue_name='billing')
+
+    @tasks.task('charge', retry_delay=0.1)
+    async def charge(task: Task, payload: dict[str, Any]) -> dict[str, Any]:
+        result = await agent.run('charge it')
+        if task.attempt == 1:
+            raise RuntimeError('simulated crash')
+        return {'output': result.output}
+
+    client = await Client.connect(db_dsn)
+    await client.migrate()
+    handle = await client.enqueue(charge.request({}, max_attempts=2))
+
+    worker = Worker(db_dsn, tasks, concurrency=1, poll_interval=0.1)
+    worker_run = asyncio.ensure_future(worker.run())
+    try:
+        result = await handle.result(timeout=30)
+    finally:
+        worker.shutdown()
+        await worker_run
+
+    assert result is not None
+    assert result.state == 'succeeded'
+    assert result.result == {'output': 'done'}
+    assert tool_calls['calls'] == 1
+    assert model_calls['calls'] == 2
 
 
 async def test_replay_after_crash_serves_checkpoint(db_dsn: str) -> None:

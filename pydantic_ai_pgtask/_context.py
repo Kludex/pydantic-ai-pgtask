@@ -7,6 +7,8 @@ from typing import TypeVar
 
 from pgtask import Task, get_current_task
 
+from ._step_names import normalize_step_name
+
 StepT = TypeVar('StepT')
 
 _CONTEXT_CACHE_MAX = 1024
@@ -20,12 +22,16 @@ class DurableTaskContext:
     instead of counting encounters itself. This context assigns occurrences in
     encounter order, so as long as steps are reached in a deterministic order a
     replayed attempt maps each step call back to the same checkpoint.
+
+    Names are normalized to pgtask's supported character set here, so callers can compose
+    them from agent, toolset, and tool names without knowing that set.
     """
 
     task: Task
     _occurrences: Counter[str] = field(default_factory=Counter)
 
     async def step(self, name: str, operation: Callable[[], Awaitable[StepT]]) -> StepT:
+        name = normalize_step_name(name)
         occurrence = self._occurrences[name]
         self._occurrences[name] += 1
         return await self.task.step(name, operation, occurrence=occurrence)

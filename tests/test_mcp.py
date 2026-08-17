@@ -12,7 +12,7 @@ from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_pgtask import PGTaskMCPToolset
 
-from .conftest import running_task
+from .conftest import CheckpointStore, running_task
 
 MCP_SCRIPT = str(Path(__file__).resolve().parent / 'fixtures' / 'mcp_server.py')
 
@@ -23,14 +23,14 @@ async def _return_hello() -> str:
     return 'hello'
 
 
-def _make_server() -> MCPToolset[None]:
+def _make_server(id: str | None = None) -> MCPToolset[None]:
     server: FastMCP[None] = FastMCP(name='calc')
 
     @server.tool
     def add(a: int, b: int) -> int:
         return a + b
 
-    return MCPToolset(server)
+    return MCPToolset(server, id=id)
 
 
 def _run_context() -> RunContext[None]:
@@ -71,6 +71,16 @@ async def test_get_tools_and_call_tool_are_checkpointed(task: Task) -> None:
         assert 'add' in tools
         result = await toolset.call_tool('add', {'a': 2, 'b': 3}, run_context, tools['add'])
     assert result
+
+
+async def test_server_id_with_unsupported_characters_is_normalized(task: Task, store: CheckpointStore) -> None:
+    toolset = PGTaskMCPToolset(_make_server(id='calc<1>'), step_name_prefix='a')
+    run_context = _run_context()
+    async with running_task(task):
+        tools = await toolset.get_tools(run_context)
+        await toolset.call_tool('add', {'a': 2, 'b': 3}, run_context, tools['add'])
+    assert ('a__mcp_server__calc_1_.get_tools', 0) in store.executions
+    assert ('a__mcp_server__calc_1_.call_tool', 0) in store.executions
 
 
 async def test_get_tools_without_context_passes_through() -> None:

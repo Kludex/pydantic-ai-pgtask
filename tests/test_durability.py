@@ -255,6 +255,30 @@ def _late_toolset(calls: dict[str, int]) -> FunctionToolset[None]:
     return toolset
 
 
+async def test_agent_level_tools_are_durable(store: CheckpointStore) -> None:
+    """Tools registered with `@agent.tool_plain` live on Pydantic AI's own toolset, whose `id`
+    is the literal `<agent>` - a step name pgtask rejects unless it is normalized."""
+    tool_calls = {'calls': 0}
+    agent: Agent[None, str] = Agent(
+        _tool_calling_model('charge_card'), name='billing', capabilities=[PGTaskDurability()]
+    )
+
+    @agent.tool_plain
+    def charge_card() -> str:
+        tool_calls['calls'] += 1
+        return 'charged'
+
+    async with running_task(make_task(store)):
+        first = await agent.run('charge it')
+
+    async with running_task(make_task(store)):
+        replayed = await agent.run('charge it')
+
+    assert tool_calls['calls'] == 1
+    assert replayed.output == first.output == 'done'
+    assert ('billing__function_toolset___agent_.call_tool:charge_card', 0) in store.executions
+
+
 async def test_override_toolsets_rejected_inside_task(task: Task) -> None:
     calls = {'calls': 0}
     agent: Agent[None, str] = Agent(_tool_calling_model('late'), name='a', capabilities=[PGTaskDurability()])
