@@ -1,38 +1,72 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, ClassVar, Literal, cast
+from typing import Any, ClassVar, Literal
 
-from pgtask import JSONValue
-from pydantic import TypeAdapter
-from pydantic_ai import FunctionToolset
+from pydantic import ValidationError
 from pydantic_ai.agent import EventStreamHandler, ParallelExecutionMode
-from pydantic_ai.agent.abstract import AbstractAgent
-from pydantic_ai.capabilities.abstract import WrapModelRequestHandler, WrapRunHandler
-from pydantic_ai.durable_exec._base import BaseDurabilityCapability
-from pydantic_ai.durable_exec._runtime_toolsets import RuntimeToolsetKind, reject_unsupported_runtime_toolsets
-from pydantic_ai.durable_exec._utils import DurableModel, StreamedActivityResult, capture_event_stream
-from pydantic_ai.exceptions import UserError
-from pydantic_ai.mcp import MCPToolset
-from pydantic_ai.messages import AgentStreamEvent, ModelResponse, ModelResponseStreamEvent
-from pydantic_ai.models import Model, ModelRequestContext
+from pydantic_ai.capabilities.abstract import WrapRunHandler
+from pydantic_ai.durable_exec import (
+    JSON_CODEC,
+    BaseDurabilityCapability,
+    DurabilityCodec,
+    DurabilityEngineSpec,
+    DurableOperationId,
+    JournalCallableOperationBackend,
+    RoleBasedOperationConfig,
+)
+from pydantic_ai.models import Model
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import AgentDepsT, RunContext
-from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
 
 from ._context import current_context
-from ._function_toolset import PGTaskFunctionToolset
-from ._mcp import PGTaskMCPToolset
-from ._serialization import deserialize_response, serialize_response
-
-_events_adapter: TypeAdapter[list[ModelResponseStreamEvent]] = TypeAdapter(list[ModelResponseStreamEvent])
 
 PGTaskParallelExecutionMode = Literal['sequential', 'parallel_ordered_events']
 """Tool-call execution modes usable with pgtask. A subset of `ParallelExecutionMode`: `'parallel'`
 is excluded because the durable context disambiguates repeated step names with an encounter-order
 occurrence counter, so checkpoints must be reached in a deterministic order for a replay to line
 up with them."""
+
+
+class CheckpointDecodeError(RuntimeError):
+    """A step's checkpoint doesn't decode as what the step returns now."""
+
+
+class _PGTaskCodec(DurabilityCodec):
+    """JSON, failing the run when a checkpoint doesn't decode.
+
+    Pydantic AI decodes a tool's checkpoint inside the tool call, where a `ValidationError` is read as
+    bad model arguments: the model would be asked to retry, and the retry would run the tool again.
+    Raising something else keeps a side effect from repeating. This includes the raw function and MCP
+    tool results that 0.0.2 checkpointed, so tasks in flight have to finish before upgrading from it.
+    """
+
+    def dump(self, tp: Any, value: Any) -> Any:
+        return JSON_CODEC.dump(tp, value)
+
+    def load(self, tp: Any, payload: Any) -> Any:
+        try:
+            return JSON_CODEC.load(tp, payload)
+        except ValidationError as exc:
+            raise CheckpointDecodeError(f'A pgtask checkpoint could not be decoded: {exc}') from exc
+
+
+class PGTaskOperationBackend(JournalCallableOperationBackend[None]):
+    """Runs each durable operation Pydantic AI hands over as one `task.step(...)` checkpoint."""
+
+    async def execute(
+        self,
+        *,
+        operation_id: DurableOperationId,
+        name: str,
+        body: Callable[[], Awaitable[object]],
+        cache_key: tuple[object, ...],
+        config: None,
+    ) -> object:
+        task_ctx = current_context()
+        assert task_ctx is not None  # pragma: no cover - operations only run inside a durable context
+        return await task_ctx.step(name, body)
 
 
 @dataclass(init=False)
@@ -64,13 +98,18 @@ class PGTaskDurability(BaseDurabilityCapability[AgentDepsT]):
         ```
     """
 
-    engine_name = 'pgtask'
-    _unsupported_runtime_toolset_kinds: ClassVar[frozenset[RuntimeToolsetKind]] = frozenset(
-        {'function', 'mcp', 'dynamic'}
+    engine_spec: ClassVar = DurabilityEngineSpec(
+        engine_name='pgtask',
+        durable_unit_noun='step',
+        durable_container_noun='task',
+        codec=_PGTaskCodec(),
+        wrapped_toolset_kinds=frozenset({'function', 'mcp', 'dynamic'}),
+        # The first MCP step connects, so a replay whose MCP steps are all checkpointed never does.
+        toolset_lifecycles={'function': 'enter-always', 'mcp': 'enter-in-durable-unit', 'dynamic': 'enter-never'},
+        # `wrap_run` applies `parallel_execution_mode`, which already excludes `'parallel'`.
+        sequential_tools_in_durable_context=False,
+        unsupported_runtime_toolset_kinds=frozenset({'function', 'mcp', 'dynamic'}),
     )
-
-    _durable_unit_noun = 'step'
-    _durable_container_noun = 'task'
 
     def __init__(
         self,
@@ -101,96 +140,18 @@ class PGTaskDurability(BaseDurabilityCapability[AgentDepsT]):
                 with its checkpoints.
         """
         super().__init__(models=models, event_stream_handler=event_stream_handler, name=name)
-        self._parallel_execution_mode = cast(ParallelExecutionMode, parallel_execution_mode)
-        self._wrappers_by_leaf: dict[int, WrapperToolset[AgentDepsT]] = {}
-        self._construction_leaves: set[int] = set()
-        self._default_model_id: str | None = None
+        self._parallel_execution_mode: ParallelExecutionMode = parallel_execution_mode
 
     @property
     def in_durable_context(self) -> bool:
         return current_context() is not None
 
-    def _bind_to_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> None:
-        # pgtask steps are ad-hoc `task.step(...)` calls, so unlike Temporal there is nothing
-        # to register up front beyond the durable toolset wrappers. Wrappers are keyed by leaf
-        # *instance* rather than toolset `id`: it keeps id-less toolsets working, and it stops
-        # a runtime toolset that happens to share an `id` with a construction-time one (e.g.
-        # `override(tools=...)` recreating the agent's own toolset) from being silently swapped
-        # for the registered wrapper.
-        self._default_model_id = agent.model if isinstance(agent.model, str) else None
-        self._wrappers_by_leaf = {}
-        self._construction_leaves = set()
-        seen_ids: dict[str, AbstractToolset[AgentDepsT]] = {}
-
-        def register(ts: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
-            ts_id = ts.id
-            if ts_id is not None:
-                existing = seen_ids.get(ts_id)
-                if existing is not None and existing is not ts:
-                    raise UserError(
-                        f'Two toolsets have the same `id` {ts_id!r}. Toolset `id`s must be unique among all '
-                        f"toolsets registered with the same agent, as they identify the toolset's steps "
-                        'within the task.'
-                    )
-                seen_ids[ts_id] = ts
-            if id(ts) not in self._construction_leaves:
-                self._construction_leaves.add(id(ts))
-                wrapper = self._wrap_leaf_toolset(ts)
-                if wrapper is not None:
-                    self._wrappers_by_leaf[id(ts)] = wrapper
-            return ts
-
-        for toolset in agent.toolsets:
-            toolset.visit_and_replace(register)
-
-    def _wrap_leaf_toolset(self, ts: AbstractToolset[AgentDepsT]) -> WrapperToolset[AgentDepsT] | None:
-        if isinstance(ts, MCPToolset):
-            return PGTaskMCPToolset(wrapped=ts, step_name_prefix=self.name)
-        if isinstance(ts, FunctionToolset):
-            return PGTaskFunctionToolset(wrapped=ts, step_name_prefix=self.name)
-        return None
-
-    def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT] | None:
-        """Swap construction-time leaves for their durable wrappers, rejecting runtime additions.
-
-        A leaf that wasn't seen at binding time - added per-run via `run(toolsets=...)`, an
-        `override(...)`, or another capability - has no durable wrapper, so executing it inside
-        a task would bypass checkpointing and re-run its side effects on recovery. Outside a
-        task everything passes through and the agent behaves like a regular agent.
-
-        Candidates are collected with `visit_and_replace`, the same leaf-only walk registration
-        used. `apply` would also visit wrapper nodes Pydantic AI inserts itself (e.g. the
-        `CapabilityOwnedToolset` around a toolset contributed by `AbstractCapability.get_toolset()`),
-        which are never registered as leaves and would otherwise be misreported as runtime
-        toolsets - naming the inner toolset that *was* registered in the error.
-        """
-        in_durable_context = self.in_durable_context
-        runtime_leaves: list[AbstractToolset[AgentDepsT]] = []
-
-        def swap(ts: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
-            if in_durable_context and id(ts) not in self._construction_leaves:
-                runtime_leaves.append(ts)
-            return self._wrappers_by_leaf.get(id(ts), ts)
-
-        swapped = toolset.visit_and_replace(swap)
-        reject_unsupported_runtime_toolsets(
-            runtime_leaves,
-            unsupported_kinds=self._unsupported_runtime_toolset_kinds,
-            engine=self.engine_name,
+    def get_durable_operation_backend(self) -> PGTaskOperationBackend:
+        return PGTaskOperationBackend(
+            agent_name=self.name,
+            default_model_id=self.default_model_id,
+            config=RoleBasedOperationConfig(model=None, event=None, capability=None, tool=None),
         )
-        return swapped
-
-    async def _dispatch_event_stream_event(self, ctx: RunContext[AgentDepsT], event: AgentStreamEvent) -> None:
-        task_ctx = current_context()
-        assert task_ctx is not None  # pragma: no cover - only dispatched inside a durable context
-        handler = self._event_stream_handler
-        assert handler is not None  # pragma: no cover - only dispatched when a handler is set
-
-        async def _inner() -> None:
-            await handler(ctx, self._single_event_stream(event))
-
-        # Checkpoint the handler call so its side effects don't re-run on recovery.
-        await task_ctx.step(f'{self.name}__event_stream_handler', _inner)
 
     async def wrap_run(
         self,
@@ -199,77 +160,8 @@ class PGTaskDurability(BaseDurabilityCapability[AgentDepsT]):
         handler: WrapRunHandler,
     ) -> AgentRunResult[Any]:
         """Apply the configured parallel-execution mode for every entry point."""
-        agent = self._agent
+        agent = self.agent
         if agent is None:  # pragma: no cover
             return await handler()
         with agent.parallel_tool_call_execution_mode(self._parallel_execution_mode):
             return await handler()
-
-    async def wrap_model_request(
-        self,
-        ctx: RunContext[AgentDepsT],
-        *,
-        request_context: ModelRequestContext,
-        handler: WrapModelRequestHandler,
-    ) -> ModelResponse:
-        """Checkpoint model requests into pgtask steps when inside a durable task."""
-        task_ctx = current_context()
-        if task_ctx is None:
-            return await handler(request_context)
-
-        # The step runs in-process, so the model needs no cross-boundary rebuild; the
-        # model id is folded into the step name so a replay maps each checkpoint back
-        # to the model it was recorded for.
-        model_id = self._model_id_for_request(ctx, request_context)
-        if model_id is not None and model_id == self._default_model_id:
-            # A string default stays raw through binding, so its requests carry the string
-            # as provenance - but it's still the agent's default model, which is
-            # checkpointed without a suffix.
-            model_id = None
-        step_suffix = '' if model_id is None else f'.{model_id}'
-        model = request_context.model
-
-        async def request_segment(request: ModelRequestContext) -> ModelResponse:
-            async def _inner() -> dict[str, JSONValue]:
-                response = await request.model.request(
-                    request.messages, request.model_settings, request.model_request_parameters
-                )
-                return cast('dict[str, JSONValue]', serialize_response(response))
-
-            payload = await task_ctx.step(f'{self.name}__model.request{step_suffix}', _inner)
-            return deserialize_response(payload)
-
-        async def request_stream_segment(request: ModelRequestContext) -> StreamedActivityResult:
-            async def _inner() -> dict[str, JSONValue]:
-                async with request.model.request_stream(
-                    request.messages, request.model_settings, request.model_request_parameters, ctx
-                ) as streamed:
-                    events = await capture_event_stream(
-                        run_context=ctx, stream=streamed, handler=self._event_stream_handler
-                    )
-                return {
-                    'response': cast('dict[str, JSONValue]', serialize_response(streamed.get())),
-                    'events': _events_adapter.dump_python(events, mode='json'),
-                }
-
-            payload = await task_ctx.step(f'{self.name}__model.request_stream{step_suffix}', _inner)
-            response_payload = payload['response']
-            assert isinstance(response_payload, dict)
-            return StreamedActivityResult(
-                response=deserialize_response(response_payload),
-                events=_events_adapter.validate_python(payload['events']),
-            )
-
-        async def cancel_suspended_response_segment(response: ModelResponse) -> None:
-            async def _inner() -> None:
-                await model.cancel_suspended_response(response)
-
-            await task_ctx.step(f'{self.name}__model.cancel_suspended_response{step_suffix}', _inner)
-
-        request_context.model = DurableModel(
-            request_context.model,
-            request_segment=request_segment,
-            request_stream_segment=request_stream_segment,
-            cancel_suspended_response_segment=cancel_suspended_response_segment,
-        )
-        return await handler(request_context)

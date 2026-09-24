@@ -21,7 +21,7 @@ from pydantic_ai.tools import RunContext
 from pydantic_ai.toolsets import ExternalToolset, FunctionToolset
 from pydantic_ai.usage import RunUsage
 
-from pydantic_ai_pgtask import PGTaskDurability
+from pydantic_ai_pgtask import CheckpointDecodeError, PGTaskDurability
 
 from .conftest import CheckpointStore, make_model, make_task, running_task
 
@@ -48,20 +48,6 @@ async def test_requires_model() -> None:
 async def test_reserved_default_model_id_raises() -> None:
     with pytest.raises(UserError, match="'default' is reserved"):
         Agent(make_model(), name='a', capabilities=[PGTaskDurability(models={'default': make_model()})])
-
-
-async def test_same_toolset_instance_in_two_places_is_wrapped_once() -> None:
-    toolset = FunctionToolset[None](id='shared')
-
-    @toolset.tool_plain
-    def echo(value: str) -> str:  # pragma: no cover - never invoked, only wrap check
-        return value
-
-    agent = Agent(make_model(), name='a', toolsets=[toolset, toolset], capabilities=[PGTaskDurability()])
-    bound = PGTaskDurability.from_agent(agent)
-    assert bound is not None
-    # One wrapper for `toolset`, one for the agent's own `<agent>` toolset.
-    assert len(bound._wrappers_by_leaf) == 2
 
 
 async def test_duplicate_toolset_id_raises() -> None:
@@ -153,35 +139,31 @@ async def test_replay_does_not_rerun_function_tool(store: CheckpointStore) -> No
     assert replayed.output == first.output == 'done'
 
 
-async def test_leaf_toolset_without_id_is_durable(store: CheckpointStore) -> None:
-    tool_calls = {'calls': 0}
-    toolset = FunctionToolset[None]()
+async def test_raw_tool_result_from_earlier_release_raises(store: CheckpointStore) -> None:
+    """0.0.2 checkpointed a tool's raw return value, which can't be told apart from a corrupt
+    checkpoint: the run fails instead of the model being asked to retry, which would run the tool again."""
+    store.checkpoints[('billing__function_toolset__tools.call_tool:charge_card', 0)] = 'charged 42'
+    toolset = FunctionToolset[None](id='tools')
 
     @toolset.tool_plain
-    def charge_card(amount: int) -> str:
-        tool_calls['calls'] += 1
-        return f'charged {amount}'
+    def charge_card(amount: int) -> str:  # pragma: no cover - never re-run
+        return 'charged again'
 
     def fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        if len(messages) == 1:
-            return ModelResponse(parts=[ToolCallPart(tool_name='charge_card', args={'amount': 7})])
-        return ModelResponse(parts=[TextPart(content='done')])
+        return ModelResponse(parts=[ToolCallPart(tool_name='charge_card', args={'amount': 42})])
 
     agent = Agent(
-        FunctionModel(fn, model_name='fn'),
-        name='idless',
-        toolsets=[toolset],
-        capabilities=[PGTaskDurability()],
+        FunctionModel(fn, model_name='fn'), name='billing', toolsets=[toolset], capabilities=[PGTaskDurability()]
     )
-
     async with running_task(make_task(store)):
-        first = await agent.run('charge it')
+        with pytest.raises(CheckpointDecodeError):
+            await agent.run('charge it')
 
-    async with running_task(make_task(store)):
-        replayed = await agent.run('charge it')
 
-    assert tool_calls['calls'] == 1
-    assert replayed.output == first.output == 'done'
+async def test_leaf_toolset_without_id_raises() -> None:
+    """Step names are built from the toolset `id`, so a leaf toolset needs one."""
+    with pytest.raises(UserError, match='need to have a unique `id`'):
+        Agent(make_model(), name='a', toolsets=[FunctionToolset[None]()], capabilities=[PGTaskDurability()])
 
 
 async def test_registered_model_selected_per_run(task: Task, store: CheckpointStore) -> None:
@@ -231,7 +213,7 @@ async def test_runtime_function_toolset_rejected(task: Task) -> None:
         return value
 
     async with running_task(task):
-        with pytest.raises(UserError, match='cannot be passed to `run\\(toolsets=...\\)` at runtime'):
+        with pytest.raises(UserError, match='cannot be added at runtime with pgtask'):
             await agent.run('hi', toolsets=[toolset])
 
 
@@ -284,7 +266,7 @@ async def test_override_toolsets_rejected_inside_task(task: Task) -> None:
     agent: Agent[None, str] = Agent(_tool_calling_model('late'), name='a', capabilities=[PGTaskDurability()])
     async with running_task(task):
         with agent.override(toolsets=[_late_toolset(calls)]):
-            with pytest.raises(UserError, match='cannot be passed to `run\\(toolsets=...\\)` at runtime'):
+            with pytest.raises(UserError, match='cannot be added at runtime with pgtask'):
                 await agent.run('hi')
     assert calls['calls'] == 0
 
@@ -308,7 +290,7 @@ async def test_override_tools_rejected_inside_task(task: Task) -> None:
     agent: Agent[None, str] = Agent(_tool_calling_model('late'), name='a', capabilities=[PGTaskDurability()])
     async with running_task(task):
         with agent.override(tools=[late]):
-            with pytest.raises(UserError, match='cannot be passed to `run\\(toolsets=...\\)` at runtime'):
+            with pytest.raises(UserError, match='cannot be added at runtime with pgtask'):
                 await agent.run('hi')
     assert calls['calls'] == 0
 
@@ -379,7 +361,7 @@ async def test_runtime_toolset_still_rejected_alongside_capability_toolset(task:
 
     agent: Agent[None, str] = Agent(make_model(), name='a', capabilities=[DemoCapability(), PGTaskDurability()])
     async with running_task(task):
-        with pytest.raises(UserError, match='cannot be passed to `run\\(toolsets=...\\)` at runtime'):
+        with pytest.raises(UserError, match='cannot be added at runtime with pgtask'):
             await agent.run('hi', toolsets=[_late_toolset({'calls': 0})])
 
 
@@ -396,7 +378,7 @@ async def test_construction_external_toolset_passes_through_unwrapped() -> None:
     assert any(t is external for t in agent.toolsets)
 
 
-async def test_mcp_tool_call_inside_task(task: Task) -> None:
+async def test_mcp_tool_call_inside_task(task: Task, store: CheckpointStore) -> None:
     from fastmcp import FastMCP
     from pydantic_ai.mcp import MCPToolset
 
@@ -411,16 +393,27 @@ async def test_mcp_tool_call_inside_task(task: Task) -> None:
             return ModelResponse(parts=[ToolCallPart(tool_name='add', args={'a': 2, 'b': 3})])
         return ModelResponse(parts=[TextPart(content='summed')])
 
-    agent = Agent(
-        FunctionModel(fn, model_name='fn'),
-        name='calc',
-        toolsets=[MCPToolset[None](server, id='calc')],
-        capabilities=[PGTaskDurability()],
-    )
+    def make_agent(toolset: MCPToolset[None]) -> Agent[None, str]:
+        return Agent(
+            FunctionModel(fn, model_name='fn'), name='calc', toolsets=[toolset], capabilities=[PGTaskDurability()]
+        )
 
     async with running_task(task):
-        result = await agent.run('add 2 and 3')
+        result = await make_agent(MCPToolset[None](server, id='calc')).run('add 2 and 3')
     assert result.output == 'summed'
+    # Step names are what a replay looks checkpoints up by, so they must not drift across releases.
+    assert store.executions == [
+        ('calc__mcp_server__calc.get_tools', 0),
+        ('calc__model.request', 0),
+        ('calc__mcp_server__calc.call_tool', 0),
+        ('calc__model.request', 1),
+    ]
+
+    # A replay served entirely from checkpoints doesn't connect, so an unreachable server is fine.
+    async with running_task(make_task(store)):
+        replayed = await make_agent(MCPToolset[None]('http://127.0.0.1:9/mcp', id='calc')).run('add 2 and 3')
+    assert replayed.output == 'summed'
+    assert len(store.executions) == 4
 
 
 async def test_event_stream_handler_receives_events(task: Task) -> None:

@@ -57,7 +57,7 @@ You author a task, call the agent inside it, and run it durably. That's the whol
 - every **function tool call** in its own checkpoint, so side effects run exactly once,
 - every **MCP** `get_tools`, `get_instructions`, and `call_tool` in its own checkpoint.
 
-Step results are stored in Postgres as JSON. On a retry after a crash, pgtask replays completed steps from their cached results instead of re-executing them, so the run resumes exactly where it stopped.
+Step names are built from the agent's `name` and each toolset's `id`, so every toolset that runs its own tools needs an `id` (including `Capability(tools=...)`); without one, building the agent raises, even if it never runs in a task. Step results are stored in Postgres as JSON. On a retry after a crash, pgtask replays completed steps from their cached results instead of re-executing them, so the run resumes exactly where it stopped.
 
 Outside a durable task the capability is transparent: the agent behaves like a regular, non-durable agent.
 
